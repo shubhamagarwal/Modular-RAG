@@ -1,8 +1,15 @@
 # Modular RAG — Codebase Assistant
 
-Ask natural-language questions about any codebase. Built with OpenAI + ChromaDB.
+Ask natural-language questions about any codebase. Built with OpenAI-compatible models (GitHub Copilot / GitHub Models), ChromaDB, and BM25.
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for a full design walkthrough.
+---
+
+## Documentation
+
+| File | What it covers |
+|------|---------------|
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Full design — modules, protocols, extension points, design decisions |
+| [FLOW.md](./FLOW.md) | Step-by-step code flow, file map, ASCII diagrams with log output at each stage |
 
 ---
 
@@ -24,6 +31,33 @@ python3 -m cli.ingest /path/to/repo      # or any other local repo
 python3 -m cli.chat
 ```
 
+### Debug mode
+
+```bash
+python3 -m cli.ingest . --debug    # shows per-file and per-chunk detail
+python3 -m cli.chat --debug        # shows BM25 scores, RRF fusion, reranker scores
+```
+
+---
+
+## How It Works
+
+Two pipelines run in sequence:
+
+**Ingestion** — indexes your codebase once into ChromaDB + BM25:
+```
+Files → DirectoryLoader → CodeChunker → OpenAIEmbedder → ChromaStore
+                                      └──────────────→ BM25Retriever (in-memory)
+```
+
+**Query** — retrieves and answers on every question:
+```
+Question → Embed → HybridRetriever (Semantic + BM25 → Weighted RRF)
+                → CrossEncoderReranker → ContextBuilder → OpenAILLM → Answer
+```
+
+See [FLOW.md](./FLOW.md) for full diagrams with actual log output at each step.
+
 ---
 
 ## Running Tests
@@ -39,24 +73,43 @@ python3 -m pytest tests/unit -v
 ```
 rag/
 ├── loaders/        # Read files from disk → Document
-├── chunkers/       # Split documents → Chunk (language-aware)
-├── embedders/      # Text → vectors (OpenAI)
+├── chunkers/       # Split documents → Chunk (token-aware)
+├── embedders/      # Text → vectors (GitHub Models API)
 ├── stores/         # Persist + search vectors (ChromaDB)
-├── retrievers/     # Hybrid semantic + keyword search
-├── rerankers/      # Cross-encoder reranking
+├── retrievers/     # BM25Retriever + HybridRetriever (weighted RRF)
+├── rerankers/      # Cross-encoder reranking (ms-marco-MiniLM)
 ├── context/        # Assemble prompt context from chunks
-├── llm/            # Stream answers (OpenAI)
+├── llm/            # Stream answers (GitHub Models / gpt-4o-mini)
+├── logger.py       # Centralised logging setup
 └── pipeline.py     # Public API: ingest() + query()
 cli/
-├── ingest.py       # CLI: index a directory
-└── chat.py         # CLI: interactive Q&A
+├── ingest.py       # python3 -m cli.ingest <path> [--debug]
+└── chat.py         # python3 -m cli.chat [--debug]
+tests/unit/         # 12 unit tests, no external calls required
 ```
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_TOKEN` | — | GitHub PAT (needs `models:read` scope) |
+| `API_BASE_URL` | `https://models.inference.ai.azure.com` | API endpoint |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
+| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Chat model |
+| `CHROMA_PERSIST_DIR` | `.chroma` | Vector store location |
+| `CHUNK_SIZE` | `1200` | Max tokens per chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap between chunks |
+| `RETRIEVAL_TOP_K` | `10` | Candidates before reranking |
+| `RERANK_TOP_K` | `4` | Final chunks sent to LLM |
+| `CONTEXT_MAX_TOKENS` | `6000` | Max context fed to LLM |
 
 ---
 
 ## Swapping Components
 
-Every module satisfies a Protocol. Drop in replacements without touching the pipeline:
+Every module satisfies a Protocol — drop in replacements without touching the pipeline:
 
 | Want | Do |
 |------|----|
