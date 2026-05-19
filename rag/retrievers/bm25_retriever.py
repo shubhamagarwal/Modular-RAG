@@ -39,11 +39,18 @@ class BM25Retriever:
 
     def search(self, query: str, k: int = 10) -> list[SearchResult]:
         tokens = _tokenize(query)
-        log.info("BM25 search — query tokens: %s", tokens)
+        log.info("BM25 search ┌─────────────────────────────────")
+        log.info("BM25 search │ Query      : %s", query)
+        log.info("BM25 search │ Tokens     : %s", tokens)
+        log.info("BM25 search │ Corpus size: %d chunks", len(self._chunks))
+
         scores: list[float] = self._index.get_scores(tokens).tolist()
+
         if not any(scores):
-            log.info("BM25 search — no matching chunks for query")
+            log.info("BM25 search │ Result     : no matching chunks")
+            log.info("BM25 search └─────────────────────────────────")
             return []
+
         max_score = max(scores)
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
         results = [
@@ -51,5 +58,16 @@ class BM25Retriever:
             for i, score in ranked[:k]
             if score >= max_score * 0.1
         ]
-        log.info("BM25 search returned %d results (top score=%.4f)", len(results), results[0].score if results else 0)
+
+        log.info("BM25 search │ Threshold  : %.4f (10%% of max=%.4f)", max_score * 0.1, max_score)
+        log.info("BM25 search │ Results    : %d chunks passed threshold", len(results))
+        log.info("BM25 search ├─────────────────────────────────")
+        for i, r in enumerate(results):
+            preview = r.chunk.content[:80].replace("\n", " ").strip()
+            log.info(
+                "BM25 search │ [%d] score=%-8.4f  %s  lines %d-%d",
+                i + 1, r.score, r.chunk.file_path, r.chunk.start_line, r.chunk.end_line,
+            )
+            log.info("BM25 search │     preview: %s%s", preview, "…" if len(r.chunk.content) > 80 else "")
+        log.info("BM25 search └─────────────────────────────────")
         return results

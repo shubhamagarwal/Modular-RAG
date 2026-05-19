@@ -171,102 +171,150 @@ rag/pipeline.py  →  query()
 ## Flow Diagram
 
 ```
-╔══════════════════════════════════════════════════════════════════╗
-║                      INGESTION  (run once)                       ║
-╠══════════════════════════════════════════════════════════════════╣
-║                                                                  ║
-║   Your Codebase  /path/to/repo                                   ║
-║         │                                                        ║
-║         ▼                                                        ║
-║   ┌─────────────────┐                                            ║
-║   │ DirectoryLoader │  walks files, skips .git / node_modules    ║
-║   └────────┬────────┘                                            ║
-║            │  list[Document]                                     ║
-║            ▼                                                     ║
-║   ┌─────────────────┐                                            ║
-║   │   CodeChunker   │  1200-token windows, 200 token overlap     ║
-║   └────────┬────────┘                                            ║
-║            │  list[Chunk]                                        ║
-║            ├─────────────────────────┐                           ║
-║            ▼                         ▼                           ║
-║   ┌─────────────────┐    ┌───────────────────────┐               ║
-║   │ OpenAIEmbedder  │    │    BM25Retriever       │               ║
-║   │ (GitHub Models) │    │  builds in-memory      │               ║
-║   │ batch embed     │    │  BM25Plus keyword index│               ║
-║   └────────┬────────┘    │  splits camelCase &    │               ║
-║            │ list[vector] │  snake_case identifiers│               ║
-║            ▼              └───────────────────────┘               ║
-║   ┌─────────────────┐                                            ║
-║   │   ChromaStore   │  upserts vectors to .chroma/ on disk       ║
-║   └─────────────────┘                                            ║
-║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                         INGESTION  (run once)                             ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                                                                           ║
+║   python3 -m cli.ingest /path/to/repo                                     ║
+║         │                                                                 ║
+║         ▼                                                                 ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ DirectoryLoader                                                  │    ║
+║   │  • walks repo recursively                                        │    ║
+║   │  • skips: .git/ __pycache__/ node_modules/ .chroma/              │    ║
+║   │  • respects .gitignore rules                                     │    ║
+║   │  LOG: "Scanning directory: /path/to/repo"                        │    ║
+║   │  LOG: "42 files loaded, 3 skipped"                               │    ║
+║   └─────────────────────────────┬────────────────────────────────────┘    ║
+║                                 │  list[Document]                         ║
+║                                 ▼                                         ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ CodeChunker                                                      │    ║
+║   │  • splits each file into overlapping token windows               │    ║
+║   │  • chunk_size=1200 tokens,  overlap=200 tokens                   │    ║
+║   │  • tracks start_line / end_line per chunk                        │    ║
+║   │  LOG: "Chunking 42 documents (chunk_size=1200, overlap=200)"     │    ║
+║   │  LOG: "318 total chunks from 42 documents"                       │    ║
+║   └──────────────────────────┬───────────────────────────────────────┘    ║
+║                              │  list[Chunk]                               ║
+║               ┌──────────────┴──────────────┐                            ║
+║               ▼                             ▼                            ║
+║   ┌────────────────────────┐   ┌─────────────────────────────────────┐   ║
+║   │ OpenAIEmbedder         │   │ BM25Retriever  (_rebuild_bm25)      │   ║
+║   │  • model:              │   │  • builds in-memory BM25Plus index  │   ║
+║   │    text-embedding-3-   │   │  • tokenises: splits camelCase &    │   ║
+║   │    small (1536-dim)    │   │    snake_case identifiers           │   ║
+║   │  • batch size: 100     │   │    "verify_token" → [verify, token] │   ║
+║   │  LOG: "Embedding 318   │   │  LOG: "Building BM25Plus index      │   ║
+║   │  texts in 4 batches"   │   │        over 318 chunks"             │   ║
+║   └───────────┬────────────┘   │  LOG: "BM25 index ready"            │   ║
+║               │ list[vector]   └─────────────────────────────────────┘   ║
+║               ▼                                                           ║
+║   ┌────────────────────────┐                                              ║
+║   │ ChromaStore            │                                              ║
+║   │  • upserts by chunk_id │                                              ║
+║   │    (idempotent)        │                                              ║
+║   │  • persists to .chroma/│                                              ║
+║   │  LOG: "Upserting 318   │                                              ║
+║   │        chunks"         │                                              ║
+║   └────────────────────────┘                                              ║
+║                                                                           ║
+║   ✓  Done → "42 files → 318 chunks in 12.4s"                             ║
+╚═══════════════════════════════════════════════════════════════════════════╝
 
-╔══════════════════════════════════════════════════════════════════╗
-║                    QUERY  (each question)                        ║
-╠══════════════════════════════════════════════════════════════════╣
-║                                                                  ║
-║   User: "Where is verify_token defined?"                         ║
-║         │                                                        ║
-║         ▼                                                        ║
-║   ┌─────────────────┐                                            ║
-║   │ OpenAIEmbedder  │  embed question → query vector             ║
-║   └────────┬────────┘                                            ║
-║            │                                                     ║
-║            ▼                                                     ║
-║   ┌──────────────────────────────────────────────────┐           ║
-║   │               HybridRetriever                    │           ║
-║   │                                                  │           ║
-║   │   query vector ──► ┌──────────────────────┐      │           ║
-║   │                    │   Semantic Search     │      │           ║
-║   │                    │   ChromaDB cosine     │      │           ║
-║   │                    │   similarity → top 10 │      │           ║
-║   │                    └──────────┬───────────┘      │           ║
-║   │                               │ ranked list A    │           ║
-║   │                               │                  │           ║
-║   │   raw query  ──►  ┌──────────────────────┐       │           ║
-║   │                   │    BM25 Search        │       │           ║
-║   │                   │    BM25Plus TF-IDF    │       │           ║
-║   │                   │    exact identifiers  │       │           ║
-║   │                   │    → top 10           │       │           ║
-║   │                   └──────────┬────────────┘       │           ║
-║   │                              │ ranked list B      │           ║
-║   │                              │                    │           ║
-║   │              ┌───────────────▼──────────────┐     │           ║
-║   │              │   Weighted RRF Fusion         │     │           ║
-║   │              │   BM25 weight=1.5             │     │           ║
-║   │              │   Semantic weight=1.0         │     │           ║
-║   │              │   score = Σ w/(rank+60)       │     │           ║
-║   │              └───────────────┬──────────────┘     │           ║
-║   └──────────────────────────────┼────────────────────┘           ║
-║                                  │  list[SearchResult] x10        ║
-║                                  ▼                                ║
-║   ┌──────────────────────────────────────┐                        ║
-║   │         CrossEncoderReranker         │                        ║
-║   │   ms-marco-MiniLM-L-6-v2 (local)     │                        ║
-║   │   scores each chunk vs full question │                        ║
-║   │   keeps top 4                        │                        ║
-║   └──────────────────┬───────────────────┘                        ║
-║                      │  list[SearchResult] x4                     ║
-║                      ▼                                            ║
-║   ┌──────────────────────────────────────┐                        ║
-║   │           ContextBuilder             │                        ║
-║   │   formats as fenced code blocks      │                        ║
-║   │   ### src/auth/jwt.py (lines 12-45)  │                        ║
-║   │   token budget: max 6000 tokens      │                        ║
-║   └──────────────────┬───────────────────┘                        ║
-║                      │  str context                               ║
-║                      ▼                                            ║
-║   ┌──────────────────────────────────────┐                        ║
-║   │             OpenAILLM                │                        ║
-║   │   gpt-4o-mini via GitHub Models      │                        ║
-║   │   temperature=0, streaming=True      │                        ║
-║   └──────────────────┬───────────────────┘                        ║
-║                      │  streamed tokens                           ║
-║                      ▼                                            ║
-║   Answer + cited file paths + line numbers                        ║
-║                                                                   ║
-╚══════════════════════════════════════════════════════════════════╝
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                      QUERY  (each question)                               ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                                                                           ║
+║   python3 -m cli.chat                                                     ║
+║   You: "Where is verify_token defined?"                                   ║
+║         │                                                                 ║
+║         ▼                                                                 ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ OpenAIEmbedder                                                   │    ║
+║   │  • embeds question → 1536-dim query vector                       │    ║
+║   │  LOG: "Embedding 1 texts in 1 batch(es)"                         │    ║
+║   └─────────────────────────────┬────────────────────────────────────┘    ║
+║                                 │  query vector                           ║
+║                                 ▼                                         ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ HybridRetriever                                                  │    ║
+║   │  LOG: "Mode: semantic + BM25"                                    │    ║
+║   │                                                                  │    ║
+║   │  query vector ──► ┌────────────────────────────────────────┐     │    ║
+║   │                   │ Semantic Search  (ChromaDB)            │     │    ║
+║   │                   │  cosine similarity over all vectors    │     │    ║
+║   │                   │  LOG: "Semantic search — top 10"       │     │    ║
+║   │                   │  LOG: "top score=0.8921"               │     │    ║
+║   │                   └──────────────────┬─────────────────────┘     │    ║
+║   │                                      │  ranked list A (10)       │    ║
+║   │                                      │                           │    ║
+║   │  raw query ──► ┌───────────────────────────────────────────┐     │    ║
+║   │                │ BM25 Search  (BM25Retriever)              │     │    ║
+║   │                │  LOG: "Query tokens: [verify, token]"     │     │    ║
+║   │                │  LOG: "Threshold: 0.84 (10% of max=8.42)" │     │    ║
+║   │                │  LOG: "[1] score=8.4210  src/auth/jwt.py  │     │    ║
+║   │                │        lines 12-45"                       │     │    ║
+║   │                │  LOG: "     preview: def verify_token..." │     │    ║
+║   │                └──────────────────┬────────────────────────┘     │    ║
+║   │                                   │  ranked list B (4)           │    ║
+║   │                                   │                              │    ║
+║   │              ┌────────────────────▼──────────────────────┐       │    ║
+║   │              │ Weighted RRF Fusion                       │       │    ║
+║   │              │  semantic weight = 1.0                    │       │    ║
+║   │              │  BM25 weight     = 1.5                    │       │    ║
+║   │              │  score = Σ weight / (rank + 60)           │       │    ║
+║   │              │                                           │       │    ║
+║   │              │  LOG: "Semantic candidates : 10"          │       │    ║
+║   │              │  LOG: "BM25 candidates     : 4"           │       │    ║
+║   │              │  LOG: "Unique after union  : 12"          │       │    ║
+║   │              │  LOG: "[1] rrf=0.04139  sem=3  bm25=1     │       │    ║
+║   │              │        src/auth/jwt.py:12-45"             │       │    ║
+║   │              │  LOG: "[2] rrf=0.03500  sem=1  bm25=-     │       │    ║
+║   │              │        src/auth/session.py:1-30"          │       │    ║
+║   │              └────────────────────┬──────────────────────┘       │    ║
+║   └───────────────────────────────────┼──────────────────────────────┘    ║
+║                                       │  list[SearchResult] x10           ║
+║                                       ▼                                   ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ CrossEncoderReranker                                             │    ║
+║   │  • model: ms-marco-MiniLM-L-6-v2  (local, lazy-loaded)          │    ║
+║   │  • scores every candidate against the full question             │    ║
+║   │  • keeps top 4                                                  │    ║
+║   │  LOG: "Reranking 10 candidates → keeping top 4"                 │    ║
+║   │  LOG: "[1] score=9.21  src/auth/jwt.py lines 12-45"             │    ║
+║   │  LOG: "[2] score=6.34  src/auth/middleware.py lines 5-38"       │    ║
+║   └─────────────────────────────┬────────────────────────────────────┘    ║
+║                                 │  list[SearchResult] x4                  ║
+║                                 ▼                                         ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ ContextBuilder                                                   │    ║
+║   │  • formats each chunk as a fenced code block:                   │    ║
+║   │      ### src/auth/jwt.py  (lines 12–45)                         │    ║
+║   │      ```python                                                   │    ║
+║   │      def verify_token(token): ...                                │    ║
+║   │      ```                                                         │    ║
+║   │  • token budget: max 6000 tokens                                │    ║
+║   │  • deduplicates same file + line range                          │    ║
+║   │  LOG: "Context built — 4 blocks, 1823 total tokens"             │    ║
+║   └─────────────────────────────┬────────────────────────────────────┘    ║
+║                                 │  str context (≤6000 tokens)             ║
+║                                 ▼                                         ║
+║   ┌──────────────────────────────────────────────────────────────────┐    ║
+║   │ OpenAILLM                                                        │    ║
+║   │  • model: gpt-4o-mini  via GitHub Models API                    │    ║
+║   │  • temperature=0  (deterministic)                               │    ║
+║   │  • streaming=True                                               │    ║
+║   │  LOG: "Sending request to models.inference.ai.azure.com"        │    ║
+║   │  LOG: "Streaming response from LLM..."                          │    ║
+║   │  LOG: "LLM stream complete — 142 tokens received"               │    ║
+║   └─────────────────────────────┬────────────────────────────────────┘    ║
+║                                 │  streamed tokens                        ║
+║                                 ▼                                         ║
+║   Answer printed token-by-token + cited file paths + line numbers         ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
 ```
 
 ---

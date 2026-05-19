@@ -6,15 +6,19 @@ from rag.stores.base import SearchResult, VectorStoreProtocol
 log = get_logger("retrievers.hybrid")
 
 
-def _rrf(rankings: list[list[str]], weights: list[float] | None = None, k: int = 60) -> list[str]:
-    """Weighted Reciprocal Rank Fusion over multiple ranked lists of chunk IDs."""
+def _rrf(
+    rankings: list[list[str]],
+    weights: list[float] | None = None,
+    k: int = 60,
+) -> dict[str, float]:
+    """Weighted Reciprocal Rank Fusion — returns chunk_id → fused_score mapping."""
     if weights is None:
         weights = [1.0] * len(rankings)
     scores: dict[str, float] = {}
     for ranked_list, weight in zip(rankings, weights):
         for rank, chunk_id in enumerate(ranked_list):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (rank + k)
-    return sorted(scores, key=lambda x: scores[x], reverse=True)
+    return scores
 
 
 class HybridRetriever:
@@ -34,15 +38,16 @@ class HybridRetriever:
         self._bm25 = bm25
 
     def search(self, query_vector: list[float], raw_query: str = "") -> list[SearchResult]:
-        log.info("HybridRetriever — starting retrieval (bm25=%s)", "enabled" if self._bm25 else "disabled")
+        log.info("HybridRetriever ┌──────────────────────────────────────")
+        log.info("HybridRetriever │ Mode : %s", "semantic + BM25" if (self._bm25 and raw_query) else "semantic only")
         semantic_results = self._store.search(query_vector, k=self._top_k)
 
         if not self._bm25 or not raw_query:
-            log.info("HybridRetriever — returning semantic-only results (%d)", len(semantic_results))
+            log.info("HybridRetriever │ Returning %d semantic-only results", len(semantic_results))
+            log.info("HybridRetriever └──────────────────────────────────────")
             return semantic_results
 
         bm25_results = self._bm25.search(raw_query, k=self._top_k)
-        log.info("HybridRetriever — fusing %d semantic + %d BM25 results via weighted RRF (w=1.0/1.5)", len(semantic_results), len(bm25_results))
 
         # Build lookup: chunk_id → SearchResult
         result_map: dict[str, SearchResult] = {}
@@ -53,10 +58,25 @@ class HybridRetriever:
         bm25_ids     = [r.chunk.chunk_id for r in bm25_results]
 
         # BM25 weight > semantic for code: exact identifier matches matter more
-        fused_ids = _rrf([semantic_ids, bm25_ids], weights=[1.0, 1.5])
-        fused = [result_map[cid] for cid in fused_ids if cid in result_map][: self._top_k]
+        rrf_scores = _rrf([semantic_ids, bm25_ids], weights=[1.0, 1.5])
+        fused_ids  = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+        fused      = [result_map[cid] for cid in fused_ids if cid in result_map][: self._top_k]
 
-        log.info("HybridRetriever — %d fused candidates after RRF", len(fused))
-        for i, r in enumerate(fused):
-            log.debug("  [%d] %s lines %d-%d (score=%.4f)", i + 1, r.chunk.file_path, r.chunk.start_line, r.chunk.end_line, r.score)
+        log.info("HybridRetriever │ Semantic candidates : %d", len(semantic_results))
+        log.info("HybridRetriever │ BM25 candidates     : %d", len(bm25_results))
+        log.info("HybridRetriever │ Unique after union  : %d", len(result_map))
+        log.info("HybridRetriever │ RRF weights         : semantic=1.0  BM25=1.5")
+        log.info("HybridRetriever ├── Fused ranking (top %d) ──────────────", len(fused))
+        for i, cid in enumerate(fused_ids[: self._top_k]):
+            r = result_map[cid]
+            sem_rank = next((j + 1 for j, x in enumerate(semantic_results) if x.chunk.chunk_id == cid), "-")
+            bm25_rank = next((j + 1 for j, x in enumerate(bm25_results)   if x.chunk.chunk_id == cid), "-")
+            preview = r.chunk.content[:70].replace("\n", " ").strip()
+            log.info(
+                "HybridRetriever │ [%d] rrf=%.5f  sem_rank=%-3s  bm25_rank=%-3s  %s:%d-%d",
+                i + 1, rrf_scores[cid], sem_rank, bm25_rank,
+                r.chunk.file_path, r.chunk.start_line, r.chunk.end_line,
+            )
+            log.info("HybridRetriever │     %s%s", preview, "…" if len(r.chunk.content) > 70 else "")
+        log.info("HybridRetriever └──────────────────────────────────────")
         return fused
